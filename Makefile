@@ -3,7 +3,7 @@ CFLAGS=-Wall -Wextra -Werror -pedantic -std=c11
 LDFLAGS=-O1
 DEBUG ?= 0
 ifneq (DEBUG, 0)
-	CFLAGS+=-O0 -ggdb
+	CFLAGS+=-O0 -ggdb -DDEBUG
 endif
 
 default: $(BINARIES)
