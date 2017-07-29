@@ -3,12 +3,39 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 #ifdef DEBUG
 #define DEBUG_INFO(...) fprintf(stderr, " [+] " __VA_ARGS__)
+#define DEBUG_HEXDUMP(blob, len) do { \
+	fprintf(stderr, " [+] %zu bytes:\n", len); \
+	for (size_t z = 0; z < len; z ++) { \
+		fprintf(stderr, " %02X", *(((uint8_t*)blob)+z)); \
+	} \
+	fprintf(stderr, "\n"); \
+} while(0)
 #else
 #define DEBUG_INFO(...)
+#define DEBUG_HEXDUMP(blob, len)
 #endif
+
+#define MAX_PATH_LEN 255
+#define TPM_HEADER_SIZE (sizeof(tpm_header_t))
+#define TPM_ORD_GetRandom 0x46
+#define TPM_TAG_RQU_COMMAND (uint16_t)(0x00C1)
+#define TPM_TAG_RSP_COMMAND (uint16_t)(0x00C4)
+
+typedef struct {
+	int chardev_fd;
+	char chardev_path[MAX_PATH_LEN];
+} tpm_context_t;
+
+typedef struct __attribute__((__packed__)) {
+	uint16_t tag;
+	uint32_t payload_length;
+	uint32_t code;
+} tpm_header_t;
 
 static const char* tpm_chardev[] = {
 	"/dev/tpm",
@@ -18,14 +45,13 @@ static const char* tpm_chardev[] = {
 };
 
 /**
- * Returns a file descriptor to the given path, or -1 if an error occurs.
  * Prints an error message if something unexpected prevents opening the
- * character device.
+ * given character device and returns -1, otherwise returns 0.
  */
-int get_tpm_fd(const char *path)
+int tpm_open(const char *path, tpm_context_t *tpm)
 {
-	int fd = open(path, O_RDWR | O_SYNC);
-	if (fd == -1 && errno != ENOENT) {
+	tpm->chardev_fd = open(path, O_RDWR | O_SYNC);
+	if (tpm->chardev_fd == -1 && errno != ENOENT) {
 		const char *hint = "";
 		if (errno == EACCES)
 			hint = ", am I running as root?";
@@ -35,30 +61,140 @@ int get_tpm_fd(const char *path)
 			path, strerror(errno), hint);
 		return errno;
 	}
-	return fd;
+	strncpy(tpm->chardev_path, path, sizeof(tpm->chardev_path));
+	return 0;
+}
+
+int tpm_close(tpm_context_t *tpm)
+{
+	int res = 0;
+	if (tpm->chardev_fd > 0)
+		res = close(tpm->chardev_fd);
+	return res;
+}
+
+/**
+ * Serialize most-significant-byte-first the given 32-bit unsigned integer
+ * in the given buffer. Returns the number of bytes used.
+ */
+size_t serialize_uint32(uint8_t *blob, size_t offset, uint32_t in)
+{
+	blob[offset++] = (uint8_t)((in >> 24) & 0xFF);
+	blob[offset++] = (uint8_t)((in >> 16) & 0xFF);
+	blob[offset++] = (uint8_t)((in >>  8) & 0xFF);
+	blob[offset++] = (uint8_t)(in & 0xFF);
+	return 4;
+}
+
+/**
+ * Serialize most-significant-byte-first the given 16-bit unsigned integer
+ * in the given buffer. Returns the number of bytes used.
+ */
+size_t serialize_uint16(uint8_t *blob, size_t offset, uint16_t in)
+{
+	blob[offset++] = (uint8_t)((in >>  8) & 0xFF);
+	blob[offset++] = (uint8_t)(in & 0xFF);
+	return 2;
+}
+
+uint32_t deserialize_uint32(uint8_t *blob)
+{
+	return ((blob[0] << 24) | (blob[1] << 16) | (blob[2] << 8) | blob[3]);
+}
+
+uint16_t deserialize_uint16(uint8_t *blob)
+{
+	return ((blob[0] << 8) | blob[1]);
+}
+
+/**
+ * Ask the TPM for cryptographically securely generated random bytes.
+ * This function may block for some time, since multiple requests might be
+ * necessary to get the requested number of bytes (some TPMs give ~100 bytes
+ * at a time).
+ */
+int tpm_get_random_bytes(tpm_context_t *ctx, uint8_t *out, size_t bytes_needed)
+{
+	if (out == NULL)
+		return -EINVAL;
+	int res = 0;
+	uint8_t *buf = malloc(TPM_HEADER_SIZE + sizeof(uint32_t) + bytes_needed);
+	if (buf == NULL)
+		return ENOMEM;
+	while (bytes_needed > 0) {
+		// Header
+		uint64_t req_len = 0;
+		req_len += serialize_uint16(buf, req_len, TPM_TAG_RQU_COMMAND);
+		req_len += serialize_uint32(buf, req_len, TPM_HEADER_SIZE + sizeof(uint32_t));
+		req_len += serialize_uint32(buf, req_len, TPM_ORD_GetRandom);
+		// Params
+		req_len += serialize_uint32(buf, req_len, (uint32_t)bytes_needed);
+		DEBUG_HEXDUMP(buf, req_len);
+		size_t req_sent = write(ctx->chardev_fd, buf, req_len);
+		if (req_sent != req_len) {
+			fprintf(stderr, "Error: truncated write to TPM device (%s)\n",
+				strerror(errno));
+			res = errno;
+			goto cleanup;
+		}
+		size_t read_len = read(ctx->chardev_fd, buf, TPM_HEADER_SIZE + sizeof(uint32_t) + bytes_needed);
+		DEBUG_HEXDUMP(buf, read_len);
+		if (read_len < TPM_HEADER_SIZE + sizeof(uint32_t)) {
+			fprintf(stderr, "Error: char dev response too short (%zu bytes)\n", read_len);
+			res = EINVAL;
+			goto cleanup;
+		}
+		uint16_t resp_tag = deserialize_uint16(buf);
+		uint32_t resp_len = deserialize_uint32(&buf[2]);
+		uint32_t resp_code = deserialize_uint32(&buf[6]);
+		uint32_t payload_len = deserialize_uint32(&buf[10]);
+		if (resp_tag != TPM_TAG_RSP_COMMAND) {
+			fprintf(stderr, "Error: invalid response tag 0x%04X\n", resp_tag);
+			res = EINVAL;
+			goto cleanup;
+		} else if (resp_code != 0) {
+			fprintf(stderr, "Error: TPM returned error code %u\n", resp_code);
+			res = resp_code;
+			goto cleanup;
+		} else if (resp_len != TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len) {
+			fprintf(stderr, "Error: malformed response, invalid payload length\n");
+			res = EINVAL;
+			goto cleanup;
+		} else if (payload_len > bytes_needed) {
+			fprintf(stderr, "Warning: TPM returned too much data (%u/%zu bytes)\n",
+				payload_len, bytes_needed);
+			payload_len = bytes_needed;
+		}
+		memcpy(out, buf + TPM_HEADER_SIZE, payload_len);
+		out += payload_len;
+		bytes_needed -= payload_len;
+	}
+cleanup:
+	if (buf != NULL)
+		free(buf);
+	return res;
 }
 
 int main()
 {
 	int res = 0;
-	int fd = -1;
-	const char *chardev = NULL;
-	for (int try = 0; tpm_chardev[try] != NULL; try++) {
-		fd = get_tpm_fd(tpm_chardev[try]);
-		if (fd != 0) {
-			chardev = tpm_chardev[try];
-			break;
-		}
+	tpm_context_t tpm;
+	int try = 0;
+	while (tpm_chardev[try] != NULL &&
+		tpm_open(tpm_chardev[try], &tpm) != 0) {
+		try++;
 	}
-	if (fd < 0) {
+	if (tpm_chardev[try] == NULL) {
 		fprintf(stderr, "Error: no TPM found. Quitting.\n");
 		res = ENOENT;
 		goto cleanup;
 	}
-	DEBUG_INFO("Using %s\n", chardev);
+	DEBUG_INFO("Using %s\n", tpm.chardev_path);
+
+	uint8_t random_stuff[4096] = {1};
+	res = tpm_get_random_bytes(&tpm, random_stuff, sizeof(random_stuff));
 
 cleanup:
-	if (fd > 0)
-		close(fd);
+	tpm_close(&tpm);
 	return res;
 }
