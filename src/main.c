@@ -8,8 +8,9 @@
 
 #ifdef DEBUG
 #define DEBUG_INFO(...) fprintf(stderr, " [+] " __VA_ARGS__)
+#define DEBUG_WARN(...) fprintf(stderr, " [!] " __VA_ARGS__)
 #define DEBUG_HEXDUMP(blob, len) do { \
-	fprintf(stderr, " [+] %zu bytes:\n", len); \
+	fprintf(stderr, " [+] %zu bytes:\n", (size_t)len); \
 	for (size_t z = 0; z < len; z ++) { \
 		fprintf(stderr, " %02X", *(((uint8_t*)blob)+z)); \
 	} \
@@ -17,15 +18,19 @@
 } while(0)
 #else
 #define DEBUG_INFO(...)
+#define DEBUG_WARN(...)
 #define DEBUG_HEXDUMP(blob, len)
 #endif
 
 #define MAX_PATH_LEN 255
 #define MAX_INT 0xFFFFFFFF
 #define TPM_HEADER_SIZE (sizeof(tpm_header_t))
-#define TPM_ORD_GetRandom 0x46
 #define TPM_TAG_RQU_COMMAND (uint16_t)(0x00C1)
 #define TPM_TAG_RSP_COMMAND (uint16_t)(0x00C4)
+#define TPM_ORD_GetRandom ((uint32_t)0x46)
+#define TPM_ORD_NV_ReadValue ((uint32_t)0xCF)
+#define TPM_E_BADINDEX 0x00000002
+#define TPM_E_WRONGPCRVAL 0x00000018
 
 typedef struct {
 	int chardev_fd;
@@ -143,7 +148,7 @@ int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len)
 		size_t read_len = read(tpm->chardev_fd, buf, TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
 		DEBUG_HEXDUMP(buf, read_len);
 		if (read_len < TPM_HEADER_SIZE) {
-			fprintf(stderr, "Error: char dev response too short (%zu bytes)\n", read_len);
+			fprintf(stderr, "Error: truncated read from TPM (%zu bytes)\n", read_len);
 			res = EINVAL;
 			goto cleanup;
 		}
@@ -155,25 +160,90 @@ int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len)
 			res = EINVAL;
 			goto cleanup;
 		} else if (resp_code != 0) {
-			fprintf(stderr, "Error: TPM returned error code %u\n", resp_code);
+			DEBUG_WARN("TPM returned error code %u\n", resp_code);
 			res = resp_code;
 			goto cleanup;
 		}
 		uint32_t payload_len = deserialize_uint32(&buf[10]);
 		if (resp_len != TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len) {
-			fprintf(stderr, "Error: malformed response, invalid payload length\n");
+			fprintf(stderr, "Error: malformed TPM response, invalid payload length\n");
 			res = EINVAL;
 			goto cleanup;
 		} else if (payload_len > out_len) {
-			fprintf(stderr, "Warning: TPM returned too much data (%u/%zu bytes)\n",
+			DEBUG_WARN("TPM returned too much data (%u/%zu bytes)\n",
 				payload_len, out_len);
 			payload_len = out_len;
 		}
-		memcpy(out, buf + TPM_HEADER_SIZE, payload_len);
+		memcpy(out, buf + TPM_HEADER_SIZE + sizeof(uint32_t), payload_len);
 		out += payload_len;
 		out_len -= payload_len;
 	}
 cleanup:
+	if (buf != NULL)
+		free(buf);
+	return res;
+}
+
+int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out, size_t out_len)
+{
+	if (out == NULL || out_len > MAX_INT)
+		return -EINVAL;
+	int res = 0;
+	uint8_t *buf = malloc(TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
+	if (buf == NULL)
+		return ENOMEM;
+	while (out_len > 0) {
+		// Header
+		uint64_t req_len = 0;
+		req_len += serialize_uint16(buf, req_len, TPM_TAG_RQU_COMMAND);
+		req_len += serialize_uint32(buf, req_len, TPM_HEADER_SIZE + sizeof(uint32_t)*3);
+		req_len += serialize_uint32(buf, req_len, TPM_ORD_NV_ReadValue);
+		// Params
+		req_len += serialize_uint32(buf, req_len, (uint32_t)addr);
+		req_len += serialize_uint32(buf, req_len, (uint32_t)offset);
+		req_len += serialize_uint32(buf, req_len, (uint32_t)out_len);
+		DEBUG_HEXDUMP(buf, req_len);
+		size_t req_sent = write(tpm->chardev_fd, buf, req_len);
+		if (req_sent != req_len) {
+			fprintf(stderr, "Error: truncated write to TPM device (%s)\n",
+				strerror(errno));
+			res = errno;
+			goto cleanup;
+		}
+		size_t read_len = read(tpm->chardev_fd, buf, TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
+		DEBUG_HEXDUMP(buf, read_len);
+		if (read_len < TPM_HEADER_SIZE) {
+			fprintf(stderr, "Error: truncated read from TPM (%zu bytes)\n", read_len);
+			res = EINVAL;
+			goto cleanup;
+		}
+		uint16_t resp_tag = deserialize_uint16(buf);
+		uint32_t resp_len = deserialize_uint32(&buf[2]);
+		uint32_t resp_code = deserialize_uint32(&buf[6]);
+		uint32_t payload_len = deserialize_uint32(&buf[10]);
+		if (resp_tag != TPM_TAG_RSP_COMMAND) {
+			fprintf(stderr, "Error: invalid response tag 0x%04X\n", resp_tag);
+			res = EINVAL;
+			goto cleanup;
+		} else if (resp_code != 0) {
+			DEBUG_WARN("TPM returned error code %u\n", resp_code);
+			res = resp_code;
+			goto cleanup;
+		} else if (resp_len != TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len) {
+			fprintf(stderr, "Error: malformed response, invalid payload length\n");
+			res = EINVAL;
+			goto cleanup;
+		} else if (payload_len > out_len) {
+			DEBUG_WARN("TPM returned too much data (%u/%zu bytes)\n",
+				payload_len, out_len);
+			payload_len = out_len;
+		}
+		memcpy(out, buf + TPM_HEADER_SIZE + sizeof(uint32_t), payload_len);
+		out += payload_len;
+		offset += payload_len;
+		out_len -= payload_len;
+	}
+cleanup	:
 	if (buf != NULL)
 		free(buf);
 	return res;
@@ -195,8 +265,20 @@ int main()
 	}
 	DEBUG_INFO("Using %s\n", tpm.chardev_path);
 
-	uint8_t random_stuff[4096] = {1};
+	/*uint8_t random_stuff[1024] = {1};
 	res = tpm_get_random_bytes(&tpm, random_stuff, sizeof(random_stuff));
+	printf("Final result:\n");
+	DEBUG_HEXDUMP(random_stuff, sizeof(random_stuff));
+	*/
+
+	uint8_t read_val[5] = {0};
+	res = tpm_read_nvram(&tpm, 0x10, 0, read_val, sizeof(read_val));
+	if (res == TPM_E_BADINDEX)
+		fprintf(stderr, "NVRAM area has been removed by a third party.\n");
+	if (res == TPM_E_WRONGPCRVAL)
+		fprintf(stderr, "WARNING: PCR values have changed.\n");
+	printf("Received: \n");
+	DEBUG_HEXDUMP(&read_val, 5);
 
 cleanup:
 	tpm_close(&tpm);
