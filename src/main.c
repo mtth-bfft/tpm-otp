@@ -51,7 +51,9 @@ static const char* tpm_chardev[] = {
 int tpm_open(const char *path, tpm_context_t *tpm)
 {
 	tpm->chardev_fd = open(path, O_RDWR | O_SYNC);
-	if (tpm->chardev_fd == -1 && errno != ENOENT) {
+	if (tpm->chardev_fd == -1) {
+		if (errno == ENOENT)
+			return errno;
 		const char *hint = "";
 		if (errno == EACCES)
 			hint = ", am I running as root?";
