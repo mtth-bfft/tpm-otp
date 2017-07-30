@@ -58,16 +58,6 @@ typedef struct __attribute__((__packed__)) {
 } tpm_oiap_auth_t;
 
 /**
- * Writes a string of cryptographically securely generated random bytes,
- * derived from an entropy pool not accessible from the TPM. This is useful
- * when generating nonces later sent as challenges sent to the TPM, so that it
- * cannot predict or force their value.
- * When first called, it may use the given buffer to initialise (or "stir")
- * its backing entropy pool, as an additional entropy source for good measure.
- */
-extern void get_local_random_bytes(uint8_t *out, size_t out_len);
-
-/**
  * Opens a file descriptor to the given character device, or prints an error
  * message if something unexpected prevents it. Returns 0 if and only if the
  * tpm_context_t was successfully initialised.

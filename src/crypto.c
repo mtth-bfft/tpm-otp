@@ -53,6 +53,11 @@
 
 #include "crypto.h"
 #include <string.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <errno.h>
 
 #define rol(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
 // blk0() and blk() perform the initial expand.
@@ -73,6 +78,50 @@
 	z+=(((w|x)&y)|(w&x))+blk(i)+0x8f1bbcdc+rol(v,5);w=rol(w,30);
 #define R4(v,w,x,y,z,i) \
 	z+=(w^x^y)+blk(i)+0xca62c1d6+rol(v,5);w=rol(w,30);
+
+static const char* local_rand_chardev[] = {
+	"/dev/urandom",
+	"/dev/random",
+	NULL
+};
+
+static int rand_chardev = -1;
+
+void init_local_random_generator(const uint8_t *in, size_t in_len)
+{
+	if (rand_chardev < 0) {
+		int try = 0;
+		while(local_rand_chardev[try] != NULL) {
+			rand_chardev = open(local_rand_chardev[try], O_RDWR);
+			if (rand_chardev != -1)
+				break;
+		}
+		if (local_rand_chardev[try] == NULL) {
+			fprintf(stderr, "Error: no random number source available. Aborting.\n");
+			exit(ENXIO);
+		}
+	}
+	write(rand_chardev, in, in_len);
+}
+
+void get_local_random_bytes(uint8_t *out, size_t out_len)
+{
+	if (rand_chardev < 0) {
+		fprintf(stderr, "Error: trying to use CSPRNG before initialisation\n");
+		exit(ENXIO);
+	}
+	ssize_t read_len;
+	do {
+		read_len = read(rand_chardev, out, out_len);
+		if (read_len <= 0) {
+			fprintf(stderr, "Error: unable to read from random number source (%s)\n",
+				strerror(errno));
+			exit(errno);
+		}
+		out_len -= read_len;
+		out += read_len;
+	} while(out_len > 0);
+}
 
 void secure_wipe(uint8_t *data, size_t len)
 {

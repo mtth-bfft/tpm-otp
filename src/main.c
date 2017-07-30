@@ -1,11 +1,11 @@
 #include "main.h"
 #include <stdio.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <fcntl.h>
 
 static const char* tpm_chardev[] = {
 	"/dev/tpm",
@@ -13,41 +13,6 @@ static const char* tpm_chardev[] = {
 	"/udev/tpm0",
 	NULL
 };
-
-static const char* local_rand_chardev[] = {
-	"/dev/urandom",
-	"/dev/random",
-	NULL
-};
-
-void get_local_random_bytes(uint8_t *out, size_t out_len)
-{
-	static int rand_chardev = -1;
-	if (rand_chardev < 0) {
-		int try = 0;
-		while(local_rand_chardev[try] != NULL) {
-			rand_chardev = open(local_rand_chardev[try], O_RDWR);
-			if (rand_chardev != -1)
-				break;
-		}
-		if (local_rand_chardev[try] == NULL) {
-			fprintf(stderr, "Error: no random number source available. Aborting.\n");
-			exit(ENXIO);
-		}
-		write(rand_chardev, out, out_len);
-	}
-	ssize_t read_len;
-	do {
-		read_len = read(rand_chardev, out, out_len);
-		if (read_len <= 0) {
-			fprintf(stderr, "Error: unable to read from random number source (%s)\n",
-				strerror(errno));
-			exit(errno);
-		}
-		out_len -= read_len;
-		out += read_len;
-	} while(out_len > 0);
-}
 
 int tpm_open(const char *path, tpm_context_t *tpm)
 {
@@ -74,7 +39,7 @@ int tpm_open(const char *path, tpm_context_t *tpm)
 		DEBUG_WARN("Unable to stir local entropy pool: error %d\n", res);
 	DEBUG_INFO("Seeding local entropy pool using %zu bytes from TPM...\n",
 		sizeof(tpm_entropy));
-	get_local_random_bytes(tpm_entropy, sizeof(tpm_entropy));
+	init_local_random_generator(tpm_entropy, sizeof(tpm_entropy));
 	//TODO: Stir the TPM's entropy pool thanks to the local one
 	return 0;
 }
@@ -341,8 +306,11 @@ int main()
 	DEBUG_HEXDUMP(random_stuff, sizeof(random_stuff));
 	*/
 
+	sha1_digest_t owner_passwd_digest;
+	sha1((uint8_t*)"pass", 4, &owner_passwd_digest);
+
 	uint8_t read_val[5] = {0};
-	res = tpm_read_nvram(&tpm, 0x10, 0, read_val, sizeof(read_val), NULL);
+	res = tpm_read_nvram(&tpm, 0x10, 0, read_val, sizeof(read_val), &owner_passwd_digest);
 	if (res == TPM_E_BADINDEX)
 		fprintf(stderr, "NVRAM area has been removed by a third party.\n");
 	else if (res == TPM_E_WRONGPCRVAL)

@@ -14,6 +14,22 @@ typedef struct __attribute__((__packed__)) {
 	uint8_t hash[SHA1_DIGEST_SIZE];
 } sha1_digest_t;
 
+/**
+ * Initialises a cryptographically secure pseudo-random number generator,
+ * possibly using the given bytes as an additional entropy source.
+ */
+extern void init_local_random_generator(const uint8_t *in, size_t in_len);
+
+/**
+ * Writes a string of cryptographically securely generated random bytes,
+ * derived from an entropy pool not accessible from the TPM. This is useful
+ * when generating nonces later sent as challenges sent to the TPM, so that it
+ * cannot predict or force their value.
+ * When first called, it may use the given buffer to initialise (or "stir")
+ * its backing entropy pool, as an additional entropy source for good measure.
+ */
+extern void get_local_random_bytes(uint8_t *out, size_t out_len);
+
 /*
  * Securely dispose of sensitive data in RAM. memset() can be optimised-out by some compilers,
  * see cert.org MSC06-C
