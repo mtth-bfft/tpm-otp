@@ -4,8 +4,8 @@
 #ifdef DEBUG
 #define DEBUG_INFO(...) fprintf(stderr, " [+] " __VA_ARGS__)
 #define DEBUG_WARN(...) fprintf(stderr, " [!] " __VA_ARGS__)
-#define DEBUG_HEXDUMP(blob, len) do { \
-	fprintf(stderr, " [+] %zu bytes:\n", (size_t)len); \
+#define DEBUG_HEXDUMP(msg, blob, len) do { \
+	fprintf(stderr, " [+] %s (%zu bytes) :\n", msg, (size_t)len); \
 	for (size_t z = 0; z < len; z ++) { \
 		fprintf(stderr, " %02X", *(((uint8_t*)blob)+z)); \
 	} \
@@ -14,7 +14,7 @@
 #else
 #define DEBUG_INFO(...) do { } while (0)
 #define DEBUG_WARN(...) do { } while (0)
-#define DEBUG_HEXDUMP(blob, len) do { } while(0)
+#define DEBUG_HEXDUMP(msg, blob, len) do { } while(0)
 #endif
 
 #define MAX_PATH_LEN 255
@@ -27,6 +27,7 @@
 #define TPM_ORD_GetRandom ((uint32_t)0x46)
 #define TPM_ORD_NV_ReadValue ((uint32_t)0xCF)
 #define TPM_ORD_OIAP ((uint32_t)0x0A)
+#define TPM_E_AUTHFAIL 0x00000001
 #define TPM_E_BADINDEX 0x00000002
 #define TPM_E_WRONGPCRVAL 0x00000018
 #define TPM_E_AUTH_CONFLICT 0x0000003B
@@ -97,4 +98,4 @@ extern int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len
  * were successful.
  */
 extern int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth,
-		tpm_buffer_t *req, const sha1_digest_t *passwd_digest);
+		const tpm_buffer_t *req, const sha1_digest_t *passwd_digest);
