@@ -30,32 +30,43 @@
 #define TPM_E_BADINDEX 0x00000002
 #define TPM_E_WRONGPCRVAL 0x00000018
 #define TPM_E_AUTH_CONFLICT 0x0000003B
-#define TPM_HEADER_SIZE (sizeof(tpm_header_t))
-#define TPM_OIAP_AUTH_SIZE (sizeof(nonce_t)*2 + sizeof(int8_t))
+#define TPM_HEADER_SIZE (sizeof(tpm_packet_header_t))
 
+// Structures from TPM v1.2 specifications
+typedef struct __attribute__((__packed__)) {
+	uint16_t tag;
+	uint32_t total_size; // total number of bytes, including header
+	uint32_t code;
+} tpm_packet_header_t;
+
+typedef struct __attribute__((__packed__)) {
+	uint8_t bytes[20];
+} tpm_nonce_t;
+
+typedef struct __attribute__((__packed__)) {
+	uint32_t handle;
+	// start of variables covered by 'hmac'
+	tpm_nonce_t nonce_local;
+	tpm_nonce_t nonce_tpm;
+	int8_t continue_auth_session;
+	// end of variables covered by 'hmac'
+	sha1_digest_t hmac;
+} tpm_oiap_auth_t;
+#define TPM_OIAP_AUTH_SIZE (offsetof(tpm_oiap_auth_t, hmac)-offsetof(tpm_oiap_auth_t, nonce_local))
+
+// Software-specific structures
 typedef struct {
 	int chardev_fd;
 	char chardev_path[MAX_PATH_LEN];
 } tpm_context_t;
 
-typedef struct __attribute__((__packed__)) {
-	uint16_t tag;
-	uint32_t payload_length;
-	uint32_t code;
-} tpm_header_t;
-
-typedef struct __attribute__((__packed__)) {
-	uint8_t bytes[20];
-} nonce_t;
-
-typedef struct __attribute__((__packed__)) {
-	nonce_t nonce_local;
-	nonce_t nonce_tpm;
-	int8_t continue_auth_session;
-	// variables that go into 'hmac' stop here
-	sha1_digest_t hmac;
-	uint32_t handle;
-} tpm_oiap_auth_t;
+typedef struct {
+	size_t pos;
+	union {
+		tpm_packet_header_t header;
+		uint8_t bytes[1];
+	} contents;
+} tpm_buffer_t;
 
 /**
  * Opens a file descriptor to the given character device, or prints an error
@@ -85,5 +96,5 @@ extern int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len
  * in the meantime. Returns 0 if and only if authentication and authorisation
  * were successful.
  */
-extern int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth, uint8_t *req,
-		size_t main_req_len, const sha1_digest_t *passwd_digest);
+extern int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth,
+		tpm_buffer_t *req, const sha1_digest_t *passwd_digest);

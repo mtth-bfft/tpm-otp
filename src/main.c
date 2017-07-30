@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 
 static const char* tpm_chardev[] = {
 	"/dev/tpm",
@@ -52,38 +53,62 @@ int tpm_close(tpm_context_t *tpm)
 	return res;
 }
 
-/**
- * Serialize most-significant-byte-first the given 32-bit unsigned integer
- * in the given buffer. Returns the number of bytes used.
- */
-size_t serialize_uint32(uint8_t *blob, size_t offset, uint32_t in)
+void serialize_uint32(uint32_t in, tpm_buffer_t *buffer)
 {
-	blob[offset++] = (uint8_t)((in >> 24) & 0xFF);
-	blob[offset++] = (uint8_t)((in >> 16) & 0xFF);
-	blob[offset++] = (uint8_t)((in >>  8) & 0xFF);
-	blob[offset++] = (uint8_t)(in & 0xFF);
-	return 4;
+	in = htonl(in);
+	memcpy(&(buffer->contents.bytes[buffer->pos]), &in, 4);
+	buffer->pos += 4;
 }
 
-/**
- * Serialize most-significant-byte-first the given 16-bit unsigned integer
- * in the given buffer. Returns the number of bytes used.
- */
-size_t serialize_uint16(uint8_t *blob, size_t offset, uint16_t in)
+void serialize_uint16(uint16_t in, tpm_buffer_t *buffer)
 {
-	blob[offset++] = (uint8_t)((in >>  8) & 0xFF);
-	blob[offset++] = (uint8_t)(in & 0xFF);
-	return 2;
+	in = htons(in);
+	memcpy(&(buffer->contents.bytes[buffer->pos]), &in, 2);
+	buffer->pos += 2;
 }
 
-uint32_t deserialize_uint32(uint8_t *blob)
+void serialize_uint8(uint8_t in, tpm_buffer_t *buffer)
 {
-	return ((blob[0] << 24) | (blob[1] << 16) | (blob[2] << 8) | blob[3]);
+	buffer->contents.bytes[buffer->pos] = in;
+	buffer->pos++;
 }
 
-uint16_t deserialize_uint16(uint8_t *blob)
+void serialize(uint8_t *in, size_t in_len, tpm_buffer_t *buffer)
 {
-	return ((blob[0] << 8) | blob[1]);
+	memcpy(&buffer->contents.bytes[buffer->pos], in, in_len);
+	buffer->pos += in_len;
+}
+
+void serialize_reset(tpm_buffer_t *buffer)
+{
+	buffer->pos = 0;
+}
+
+uint32_t deserialize_uint32(tpm_buffer_t *buffer)
+{
+	buffer->pos += 4;
+	return ((buffer->contents.bytes[buffer->pos-4] << 24) |
+		(buffer->contents.bytes[buffer->pos-3] << 16) |
+		(buffer->contents.bytes[buffer->pos-2] << 8) |
+		(buffer->contents.bytes[buffer->pos-1]));
+}
+
+uint16_t deserialize_uint16(tpm_buffer_t *buffer)
+{
+	buffer->pos += 2;
+	return ((buffer->contents.bytes[buffer->pos-2] << 8) |
+		(buffer->contents.bytes[buffer->pos-1]));
+}
+
+uint8_t deserialize_uint8(tpm_buffer_t *buffer)
+{
+	return buffer->contents.bytes[buffer->pos++];
+}
+
+void deserialize(uint8_t *out, size_t out_len, tpm_buffer_t *buffer)
+{
+	memcpy(out, &buffer->contents.bytes[buffer->pos], out_len);
+	buffer->pos += out_len;
 }
 
 int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len)
@@ -91,35 +116,37 @@ int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len)
 	if (out == NULL || out_len > MAX_INT)
 		return -EINVAL;
 	int res = 0;
-	uint8_t *buf = malloc(TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
+	tpm_buffer_t *buf = malloc(sizeof(tpm_buffer_t) + sizeof(uint32_t) + out_len);
 	if (buf == NULL)
 		return ENOMEM;
 	while (out_len > 0) {
 		// Header
-		uint64_t req_len = 0;
-		req_len += serialize_uint16(buf, req_len, TPM_TAG_RQU_COMMAND);
-		req_len += serialize_uint32(buf, req_len, TPM_HEADER_SIZE + sizeof(uint32_t));
-		req_len += serialize_uint32(buf, req_len, TPM_ORD_GetRandom);
+		serialize_reset(buf);
+		serialize_uint16(TPM_TAG_RQU_COMMAND, buf);
+		serialize_uint32(TPM_HEADER_SIZE + sizeof(uint32_t), buf);
+		serialize_uint32(TPM_ORD_GetRandom, buf);
 		// Params
-		req_len += serialize_uint32(buf, req_len, (uint32_t)out_len);
-		DEBUG_HEXDUMP(buf, req_len);
-		size_t req_sent = write(tpm->chardev_fd, buf, req_len);
-		if (req_sent != req_len) {
+		serialize_uint32(out_len, buf);
+		DEBUG_HEXDUMP(buf->contents.bytes, buf->pos);
+		size_t req_sent = write(tpm->chardev_fd, &buf->contents.bytes, buf->pos);
+		if (req_sent != buf->pos) {
 			fprintf(stderr, "Error: truncated write to TPM device (%s)\n",
 				strerror(errno));
 			res = errno;
 			goto cleanup;
 		}
-		size_t read_len = read(tpm->chardev_fd, buf, TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
+		size_t read_len = read(tpm->chardev_fd, &buf->contents.bytes,
+				TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
 		DEBUG_HEXDUMP(buf, read_len);
 		if (read_len < TPM_HEADER_SIZE) {
 			fprintf(stderr, "Error: truncated read from TPM (%zu bytes)\n", read_len);
 			res = EINVAL;
 			goto cleanup;
 		}
+		serialize_reset(buf);
 		uint16_t resp_tag = deserialize_uint16(buf);
-		uint32_t resp_len = deserialize_uint32(&buf[2]);
-		uint32_t resp_code = deserialize_uint32(&buf[6]);
+		uint32_t resp_len = deserialize_uint32(buf);
+		uint32_t resp_code = deserialize_uint32(buf);
 		if (resp_tag != TPM_TAG_RSP_COMMAND) {
 			fprintf(stderr, "Error: invalid response tag 0x%04X\n", resp_tag);
 			res = EINVAL;
@@ -129,7 +156,7 @@ int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len)
 			res = resp_code;
 			goto cleanup;
 		}
-		uint32_t payload_len = deserialize_uint32(&buf[10]);
+		uint32_t payload_len = deserialize_uint32(buf);
 		if (resp_len != TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len) {
 			fprintf(stderr, "Error: malformed TPM response, invalid payload length\n");
 			res = EINVAL;
@@ -139,44 +166,47 @@ int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len)
 				payload_len, out_len);
 			payload_len = out_len;
 		}
-		memcpy(out, buf + TPM_HEADER_SIZE + sizeof(uint32_t), payload_len);
+		deserialize(out, payload_len, buf);
 		out += payload_len;
 		out_len -= payload_len;
 	}
 cleanup:
-	if (buf != NULL)
-		free(buf);
+	free(buf);
 	return res;
 }
 
-int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth, uint8_t *req,
-		size_t main_req_len, const sha1_digest_t *passwd_digest)
+int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth,
+		tpm_buffer_t *main_req, const sha1_digest_t *passwd_digest)
 {
 	// Request a nonce from the TPM
 	int res = 0;
-	uint8_t buf[TPM_HEADER_SIZE] = {0};
-	uint64_t req_len = 0;
-	req_len += serialize_uint16(buf, req_len, TPM_TAG_RQU_COMMAND);
-	req_len += serialize_uint32(buf, req_len, TPM_HEADER_SIZE);
-	req_len += serialize_uint32(buf, req_len, TPM_ORD_OIAP);
-	DEBUG_HEXDUMP(buf, req_len);
-	size_t req_sent = write(tpm->chardev_fd, buf, req_len);
-	if (req_sent != req_len) {
+	tpm_buffer_t *buf = malloc(sizeof(tpm_buffer_t) + sizeof(uint32_t) + sizeof(tpm_nonce_t));
+	if (buf == NULL)
+		return ENOMEM;
+	serialize_reset(buf);
+	serialize_uint16(TPM_TAG_RQU_COMMAND, buf);
+	serialize_uint32(TPM_HEADER_SIZE, buf);
+	serialize_uint32(TPM_ORD_OIAP, buf);
+	DEBUG_HEXDUMP(buf, buf->pos);
+	size_t req_sent = write(tpm->chardev_fd, &buf->contents.bytes, buf->pos);
+	if (req_sent != buf->pos) {
 		fprintf(stderr, "Error: truncated write to TPM device (%s)\n",
 				strerror(errno));
 		res = errno;
 		goto cleanup;
 	}
-	size_t read_len = read(tpm->chardev_fd, buf, TPM_HEADER_SIZE + sizeof(uint32_t) + sizeof(nonce_t));
+	size_t read_len = read(tpm->chardev_fd, &buf->contents.bytes,
+			TPM_HEADER_SIZE + sizeof(uint32_t) + sizeof(tpm_nonce_t));
 	DEBUG_HEXDUMP(buf, read_len);
 	if (read_len < TPM_HEADER_SIZE) {
 		fprintf(stderr, "Error: truncated read from TPM (%zu bytes)\n", read_len);
 		res = EINVAL;
 		goto cleanup;
 	}
+	serialize_reset(buf);
 	uint16_t resp_tag = deserialize_uint16(buf);
-	uint32_t resp_len = deserialize_uint32(&buf[2]);
-	uint32_t resp_code = deserialize_uint32(&buf[6]);
+	uint32_t resp_len = deserialize_uint32(buf);
+	uint32_t resp_code = deserialize_uint32(buf);
 	if (resp_tag != TPM_TAG_RSP_COMMAND) {
 		fprintf(stderr, "Error: invalid response tag 0x%04X\n", resp_tag);
 		res = EINVAL;
@@ -190,22 +220,26 @@ int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth, uint8_t *req,
 		res = EINVAL;
 		goto cleanup;
 	}
-	auth->handle = deserialize_uint32(&buf[10]);
-	memcpy(&auth->nonce_tpm, &buf[14], sizeof(auth->nonce_tpm));
-	DEBUG_INFO("Auth handle acquired = %d\n", auth->handle);
-	DEBUG_INFO("TPM sent auth nonce:\n");
-	DEBUG_HEXDUMP(&auth->nonce_tpm, sizeof(auth->nonce_tpm));
+	auth->handle = deserialize_uint32(buf);
+	DEBUG_INFO("Received auth handle %d\n", auth->handle);
+	deserialize((uint8_t*)&auth->nonce_tpm, sizeof(auth->nonce_tpm), buf);
 	auth->continue_auth_session = 0;
 	// Generate our own nonce
 	get_local_random_bytes((uint8_t*)&auth->nonce_local, sizeof(auth->nonce_local));
-	// Get a digest of the request to be authenticated
-	sha1_digest_t req_digest = {0};
-	sha1(req, main_req_len, &req_digest);
+	// Get a digest of the request to be authenticated, minus its
+	// tag (16-bit int) and payload length (32-bit int) = 6 bytes
+	DEBUG_INFO("Digest of the request to authenticate:\n");
+	sha1_digest_t main_req_digest = {0};
+	sha1(main_req->contents.bytes + 6, main_req->pos - 6, &main_req_digest);
+	DEBUG_HEXDUMP(&main_req_digest, sizeof(main_req_digest));
 	// Get a HMAC of that digest + the TPM's nonce + our nonce + the
 	// "continue session" parameter, with the secret's digest as a key
-	hmac_sha1((uint8_t*)auth, TPM_OIAP_AUTH_SIZE, (uint8_t*)passwd_digest,
-		SHA1_DIGEST_SIZE, &auth->hmac);
+	DEBUG_INFO("Authenticated HMAC to send:\n");
+	hmac_sha1((uint8_t*)&auth->nonce_local, TPM_OIAP_AUTH_SIZE,
+		(uint8_t*)passwd_digest, SHA1_DIGEST_SIZE, &auth->hmac);
+	DEBUG_HEXDUMP(&auth->hmac, sizeof(auth->hmac));
 cleanup:
+	free(buf);
 	return res;
 }
 
@@ -215,47 +249,56 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 	if (out == NULL || out_len > MAX_INT)
 		return -EINVAL;
 	int res = 0;
-	uint8_t *buf = malloc(TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
+	tpm_buffer_t *buf = malloc(sizeof(tpm_buffer_t) + sizeof(tpm_oiap_auth_t) + sizeof(uint32_t) + out_len);
 	if (buf == NULL)
 		return ENOMEM;
 	while (out_len > 0) {
 		DEBUG_INFO("Requesting %zu bytes at offset %d from index %d\n",
 			out_len, offset, addr);
 		// Header
-		uint64_t req_len = 0;
 		uint16_t tag = (owner_passwd_digest == NULL ? TPM_TAG_RQU_COMMAND : TPM_TAG_RQU_AUTH1_COMMAND);
-		req_len += serialize_uint16(buf, req_len, tag);
-		req_len += serialize_uint32(buf, req_len, TPM_HEADER_SIZE + sizeof(uint32_t)*3);
-		req_len += serialize_uint32(buf, req_len, TPM_ORD_NV_ReadValue);
+		serialize_reset(buf);
+		serialize_uint16(tag, buf);
+		serialize_uint32(TPM_HEADER_SIZE + sizeof(uint32_t)*3, buf);
+		serialize_uint32(TPM_ORD_NV_ReadValue, buf);
 		// Params
-		req_len += serialize_uint32(buf, req_len, (uint32_t)addr);
-		req_len += serialize_uint32(buf, req_len, (uint32_t)offset);
-		req_len += serialize_uint32(buf, req_len, (uint32_t)out_len);
-		DEBUG_HEXDUMP(buf, req_len);
+		serialize_uint32((uint32_t)addr, buf);
+		serialize_uint32((uint32_t)offset, buf);
+		serialize_uint32((uint32_t)out_len, buf);
+		DEBUG_HEXDUMP(buf, buf->pos);
+		tpm_oiap_auth_t auth = {0};
 		if (owner_passwd_digest != NULL) {
 			DEBUG_INFO("Performing OIAP authorization...\n");
-			tpm_oiap_auth_t auth = {0};
-			res = tpm_auth_oiap(tpm, &auth, buf, req_len, owner_passwd_digest);
-			DEBUG_INFO("OIAP result = %d\n", res);
+			buf->contents.header.total_size += sizeof(uint32_t) + sizeof(tpm_nonce_t) + 1;
+			res = tpm_auth_oiap(tpm, &auth, buf, owner_passwd_digest);
+			if (res != 0)
+				goto cleanup;
+			serialize_uint32((uint32_t)auth.handle, buf);
+			serialize((uint8_t*)&auth.nonce_local, sizeof(tpm_nonce_t), buf);
+			serialize_uint8(auth.continue_auth_session, buf);
 		}
-		size_t req_sent = write(tpm->chardev_fd, buf, req_len);
-		if (req_sent != req_len) {
+		DEBUG_INFO("Request ready:\n");
+		DEBUG_HEXDUMP(buf->contents.bytes, buf->pos);
+		size_t req_sent = write(tpm->chardev_fd, buf->contents.bytes, buf->pos);
+		if (req_sent != buf->pos) {
 			fprintf(stderr, "Error: truncated write to TPM device (%s)\n",
 				strerror(errno));
 			res = errno;
 			goto cleanup;
 		}
-		size_t read_len = read(tpm->chardev_fd, buf, TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
-		DEBUG_HEXDUMP(buf, read_len);
+		size_t read_len = read(tpm->chardev_fd, buf->contents.bytes,
+				TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
+		DEBUG_HEXDUMP(buf->contents.bytes, read_len);
 		if (read_len < TPM_HEADER_SIZE) {
 			fprintf(stderr, "Error: truncated read from TPM (%zu bytes)\n", read_len);
 			res = EINVAL;
 			goto cleanup;
 		}
+		serialize_reset(buf);
 		uint16_t resp_tag = deserialize_uint16(buf);
-		uint32_t resp_len = deserialize_uint32(&buf[2]);
-		uint32_t resp_code = deserialize_uint32(&buf[6]);
-		uint32_t payload_len = deserialize_uint32(&buf[10]);
+		uint32_t resp_len = deserialize_uint32(buf);
+		uint32_t resp_code = deserialize_uint32(buf);
+		uint32_t payload_len = deserialize_uint32(buf);
 		if (resp_tag != TPM_TAG_RSP_COMMAND) {
 			fprintf(stderr, "Error: invalid response tag 0x%04X\n", resp_tag);
 			res = EINVAL;
@@ -269,16 +312,36 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 			res = EINVAL;
 			goto cleanup;
 		} else if (payload_len > out_len) {
-			DEBUG_WARN("TPM returned too much data (%u/%zu bytes)\n",
+			fprintf(stderr, "Error: TPM returned %u instead of %zu bytes)\n",
 				payload_len, out_len);
-			payload_len = out_len;
+			res = EINVAL;
+			goto cleanup;
 		}
-		memcpy(out, buf + TPM_HEADER_SIZE + sizeof(uint32_t), payload_len);
+		if (owner_passwd_digest != NULL) {
+			deserialize((uint8_t*)&auth.nonce_tpm, sizeof(tpm_nonce_t), buf);
+			tpm_nonce_t local_nonce_bis;
+			deserialize((uint8_t*)&local_nonce_bis, sizeof(tpm_nonce_t), buf);
+			if (!memcmp(&auth.nonce_local, &local_nonce_bis, sizeof(tpm_nonce_t))) {
+				fprintf(stderr, "Error: TPM returned a different nonce from ours\n");
+				res = EINVAL;
+				goto cleanup;
+			}
+			auth.continue_auth_session = deserialize_uint8(buf);
+			sha1_digest_t expected_hmac;
+			sha1_digest_t received_hmac;
+			deserialize((uint8_t*)&received_hmac, sizeof(sha1_digest_t), buf);
+			//hmac_sha1(buf, &expected_hmac);
+			if (!memcmp(&expected_hmac, &buf[14+payload_len+sizeof(tpm_nonce_t)*2+1], sizeof(sha1_digest_t))) {
+				fprintf(stderr, "Error: TPM failed to authenticate via OIAP\n");
+				goto cleanup;
+			}
+		}
+		deserialize(out, payload_len, buf);
 		out += payload_len;
 		offset += payload_len;
 		out_len -= payload_len;
 	}
-cleanup	:
+cleanup:
 	if (buf != NULL)
 		free(buf);
 	return res;
