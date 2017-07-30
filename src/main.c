@@ -187,7 +187,7 @@ int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth,
 	serialize_uint16(TPM_TAG_RQU_COMMAND, buf);
 	serialize_uint32(TPM_HEADER_SIZE, buf);
 	serialize_uint32(TPM_ORD_OIAP, buf);
-	DEBUG_HEXDUMP("Sending OIAP request", buf, buf->pos);
+	DEBUG_HEXDUMP("Sending OIAP request", buf->contents.bytes, buf->pos);
 	size_t req_sent = write(tpm->chardev_fd, &buf->contents.bytes, buf->pos);
 	if (req_sent != buf->pos) {
 		fprintf(stderr, "Error: truncated write to TPM device (%s)\n",
@@ -197,7 +197,7 @@ int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth,
 	}
 	size_t read_len = read(tpm->chardev_fd, &buf->contents.bytes,
 			TPM_HEADER_SIZE + sizeof(uint32_t) + sizeof(tpm_nonce_t));
-	DEBUG_HEXDUMP("OIAP Response received", buf, read_len);
+	DEBUG_HEXDUMP("OIAP Response received", buf->contents.bytes, read_len);
 	if (read_len < TPM_HEADER_SIZE) {
 		fprintf(stderr, "Error: truncated read from TPM (%zu bytes)\n", read_len);
 		res = EINVAL;
@@ -221,23 +221,20 @@ int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth,
 		goto cleanup;
 	}
 	auth->handle = deserialize_uint32(buf);
-	DEBUG_INFO("Received auth handle %d\n", auth->handle);
+	DEBUG_INFO("Assigned auth handle %d\n", auth->handle);
 	deserialize((uint8_t*)&auth->nonce_tpm, sizeof(auth->nonce_tpm), buf);
 	auth->continue_auth_session = 0;
 	// Generate our own nonce
 	get_local_random_bytes((uint8_t*)&auth->nonce_local, sizeof(auth->nonce_local));
 	// Get a digest of the request to be authenticated, minus its
-	// tag (16-bit int) and payload length (32-bit int) = 6 bytes
-	sha1_digest_t main_req_digest = {0};
+	// tag (16-bit int) and payload length (32-bit int)
 	sha1((uint8_t*)&main_req->contents.header.code,
 		main_req->pos - offsetof(tpm_packet_header_t, code),
-		&main_req_digest);
-	DEBUG_HEXDUMP("Digest of the request to authenticate", &main_req_digest, sizeof(main_req_digest));
+		&auth->request_digest);
 	// Get a HMAC of that digest + the TPM's nonce + our nonce + the
 	// "continue session" parameter, with the secret's digest as a key
-	hmac_sha1((uint8_t*)&auth->nonce_local, TPM_OIAP_AUTH_SIZE,
+	hmac_sha1((uint8_t*)&auth->request_digest, TPM_OIAP_AUTH_SIZE,
 		(uint8_t*)passwd_digest, SHA1_DIGEST_SIZE, &auth->hmac);
-	DEBUG_HEXDUMP("Authenticated HMAC to send", &auth->hmac, sizeof(auth->hmac));
 cleanup:
 	free(buf);
 	return res;
@@ -276,7 +273,7 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 			serialize_uint8(auth.continue_auth_session, buf);
 			serialize((uint8_t*)&auth.hmac, sizeof(auth.hmac), buf);
 		}
-		DEBUG_HEXDUMP("Sending request", buf->contents.bytes, buf->pos);
+		DEBUG_HEXDUMP("Sending NV_Read request", buf->contents.bytes, buf->pos);
 		size_t req_sent = write(tpm->chardev_fd, buf->contents.bytes, buf->pos);
 		if (req_sent != buf->pos) {
 			fprintf(stderr, "Error: truncated write to TPM device (%s)\n",
@@ -284,9 +281,8 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 			res = errno;
 			goto cleanup;
 		}
-		size_t read_len = read(tpm->chardev_fd, buf->contents.bytes,
-				TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
-		DEBUG_HEXDUMP("Received response", buf->contents.bytes, read_len);
+		size_t read_len = read(tpm->chardev_fd, buf->contents.bytes, 9999); //FIXME: variable read len?
+		DEBUG_HEXDUMP("Received NV_Read response", buf->contents.bytes, read_len);
 		if (read_len < TPM_HEADER_SIZE) {
 			fprintf(stderr, "Error: truncated read from TPM (%zu bytes)\n", read_len);
 			res = EINVAL;
@@ -296,8 +292,8 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 		uint16_t resp_tag = deserialize_uint16(buf);
 		uint32_t resp_len = deserialize_uint32(buf);
 		uint32_t resp_code = deserialize_uint32(buf);
-		uint32_t payload_len = deserialize_uint32(buf);
-		if (resp_tag != TPM_TAG_RSP_COMMAND) {
+		if ((owner_passwd_digest == NULL && resp_tag != TPM_TAG_RSP_COMMAND) ||
+				(owner_passwd_digest != NULL && resp_tag != TPM_TAG_RSP_AUTH1_COMMAND)) {
 			fprintf(stderr, "Error: invalid response tag 0x%04X\n", resp_tag);
 			res = EINVAL;
 			goto cleanup;
@@ -305,17 +301,35 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 			DEBUG_WARN("TPM returned error code %u\n", resp_code);
 			res = resp_code;
 			goto cleanup;
-		} else if (resp_len != TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len) {
-			fprintf(stderr, "Error: malformed response, invalid payload length\n");
-			res = EINVAL;
+		} else if (resp_len != read_len || resp_len < TPM_HEADER_SIZE + sizeof(uint32_t)) {
+			fprintf(stderr, "Error: truncated read from TPM (%zu/%d bytes)\n",
+				read_len, resp_len);
+			res = E2BIG;
 			goto cleanup;
-		} else if (payload_len > out_len) {
+		}
+		uint32_t payload_len = deserialize_uint32(buf);
+		if (payload_len > out_len) {
 			fprintf(stderr, "Error: TPM returned %u instead of %zu bytes)\n",
 				payload_len, out_len);
 			res = EINVAL;
 			goto cleanup;
+		} else if (resp_len < TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len) {
+			fprintf(stderr, "Error: truncated read from TPM (%d/%zu bytes)\n",
+				resp_len, TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len);
+			res = E2BIG;
+			goto cleanup;
 		}
+		deserialize(out, payload_len, buf);
+		out += payload_len;
+		offset += payload_len;
+		out_len -= payload_len;
 		if (owner_passwd_digest != NULL) {
+			if (resp_len < TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len) {
+				fprintf(stderr, "Error: truncated read from TPM (%d/%zu bytes)\n",
+					resp_len, TPM_HEADER_SIZE + sizeof(uint32_t) + payload_len);
+				res = E2BIG;
+				goto cleanup;
+			}
 			deserialize((uint8_t*)&auth.nonce_tpm, sizeof(tpm_nonce_t), buf);
 			tpm_nonce_t local_nonce_bis;
 			deserialize((uint8_t*)&local_nonce_bis, sizeof(tpm_nonce_t), buf);
@@ -328,16 +342,12 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 			sha1_digest_t expected_hmac;
 			sha1_digest_t received_hmac;
 			deserialize((uint8_t*)&received_hmac, sizeof(sha1_digest_t), buf);
-			//hmac_sha1(buf, &expected_hmac);
+			// TODO: verify response HMAC
 			if (!memcmp(&expected_hmac, &buf[14+payload_len+sizeof(tpm_nonce_t)*2+1], sizeof(sha1_digest_t))) {
 				fprintf(stderr, "Error: TPM failed to authenticate via OIAP\n");
 				goto cleanup;
 			}
 		}
-		deserialize(out, payload_len, buf);
-		out += payload_len;
-		offset += payload_len;
-		out_len -= payload_len;
 	}
 cleanup:
 	if (buf != NULL)
@@ -368,6 +378,7 @@ int main()
 
 	sha1_digest_t owner_passwd_digest;
 	sha1((uint8_t*)"pass", 4, &owner_passwd_digest);
+	DEBUG_HEXDUMP("Password digest", &owner_passwd_digest, SHA1_DIGEST_SIZE);
 
 	uint8_t read_val[5] = {0};
 	res = tpm_read_nvram(&tpm, 0x10, 0, read_val, sizeof(read_val), &owner_passwd_digest);
@@ -377,9 +388,10 @@ int main()
 		fprintf(stderr, "WARNING: PCR values have changed.\n");
 	else if (res == TPM_E_AUTH_CONFLICT)
 		fprintf(stderr, "NVRAM area requires authentication.\n");
-	else {
+	else if (res == TPM_E_AUTHFAIL)
+		fprintf(stderr, "Invalid password, authentication failure\n");
+	else
 		DEBUG_HEXDUMP("Received", &read_val, 5);
-	}
 
 cleanup:
 	tpm_close(&tpm);

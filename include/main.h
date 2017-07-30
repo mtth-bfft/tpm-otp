@@ -24,6 +24,7 @@
 #define TPM_TAG_RQU_COMMAND ((uint16_t)(0x00C1))
 #define TPM_TAG_RQU_AUTH1_COMMAND ((uint16_t)(0x00C2))
 #define TPM_TAG_RSP_COMMAND (uint16_t)(0x00C4)
+#define TPM_TAG_RSP_AUTH1_COMMAND ((uint16_t)(0x00C5))
 #define TPM_ORD_GetRandom ((uint32_t)0x46)
 #define TPM_ORD_NV_ReadValue ((uint32_t)0xCF)
 #define TPM_ORD_OIAP ((uint32_t)0x0A)
@@ -47,13 +48,14 @@ typedef struct __attribute__((__packed__)) {
 typedef struct __attribute__((__packed__)) {
 	uint32_t handle;
 	// start of variables covered by 'hmac'
-	tpm_nonce_t nonce_local;
+	sha1_digest_t request_digest;
 	tpm_nonce_t nonce_tpm;
+	tpm_nonce_t nonce_local;
 	int8_t continue_auth_session;
 	// end of variables covered by 'hmac'
 	sha1_digest_t hmac;
 } tpm_oiap_auth_t;
-#define TPM_OIAP_AUTH_SIZE (offsetof(tpm_oiap_auth_t, hmac)-offsetof(tpm_oiap_auth_t, nonce_local))
+#define TPM_OIAP_AUTH_SIZE (offsetof(tpm_oiap_auth_t, hmac)-offsetof(tpm_oiap_auth_t, request_digest))
 
 // Software-specific structures
 typedef struct {

@@ -11,8 +11,8 @@ default: $(BINARIES)
 %: src/%.o src/crypto.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-src/%.o: src/%.c
-	$(CC) $(CFLAGS) -c -o $@ $^
+src/%.o: src/%.c include/%.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 .PHONY: clean
 clean:
