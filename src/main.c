@@ -1,3 +1,4 @@
+#include "main.h"
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -5,60 +6,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
-
-#ifdef DEBUG
-#define DEBUG_INFO(...) fprintf(stderr, " [+] " __VA_ARGS__)
-#define DEBUG_WARN(...) fprintf(stderr, " [!] " __VA_ARGS__)
-#define DEBUG_HEXDUMP(blob, len) do { \
-	fprintf(stderr, " [+] %zu bytes:\n", (size_t)len); \
-	for (size_t z = 0; z < len; z ++) { \
-		fprintf(stderr, " %02X", *(((uint8_t*)blob)+z)); \
-	} \
-	fprintf(stderr, "\n"); \
-} while(0)
-#else
-#define DEBUG_INFO(...)
-#define DEBUG_WARN(...)
-#define DEBUG_HEXDUMP(blob, len)
-#endif
-
-#define MAX_PATH_LEN 255
-#define MAX_INT 0xFFFFFFFF
-
-// Constants from TPM v1.2 specifications
-#define TPM_TAG_RQU_COMMAND ((uint16_t)(0x00C1))
-#define TPM_TAG_RQU_AUTH1_COMMAND ((uint16_t)(0x00C2))
-#define TPM_TAG_RSP_COMMAND (uint16_t)(0x00C4)
-#define TPM_ORD_GetRandom ((uint32_t)0x46)
-#define TPM_ORD_NV_ReadValue ((uint32_t)0xCF)
-#define TPM_E_BADINDEX 0x00000002
-#define TPM_E_WRONGPCRVAL 0x00000018
-#define TPM_E_AUTH_CONFLICT 0x0000003B
-#define TPM_HEADER_SIZE (sizeof(tpm_header_t))
-#define SHA1_DIGEST_SIZE 14 // 160 bits
-
-typedef struct {
-	int chardev_fd;
-	char chardev_path[MAX_PATH_LEN];
-} tpm_context_t;
-
-typedef struct __attribute__((__packed__)) {
-	uint16_t tag;
-	uint32_t payload_length;
-	uint32_t code;
-} tpm_header_t;
-
-typedef struct __attribute__((__packed__)) {
-	uint8_t hash[SHA1_DIGEST_SIZE];
-} sha1_hash_t;
-
-typedef struct __attribute__((__packed__)) {
-	uint32_t auth_handle;
-	sha1_hash_t nonce_local;
-	sha1_hash_t nonce_tpm;
-	int8_t continue_auth_session;
-	sha1_hash_t hmac;
-} tpm_oiap_auth_t;
 
 static const char* tpm_chardev[] = {
 	"/dev/tpm",
@@ -68,21 +15,11 @@ static const char* tpm_chardev[] = {
 };
 
 static const char* local_rand_chardev[] = {
-	"/dev/random",
 	"/dev/urandom",
+	"/dev/random",
 	NULL
 };
 
-int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len);
-
-/**
- * Writes a string of cryptographically securely generated random bytes,
- * derived from an entropy pool not accessible from the TPM. This is useful
- * when generating nonces later sent as challenges sent to the TPM, so that it
- * cannot predict or force their value.
- * When first called, it may use the given buffer to initialise (or "stir")
- * its backing entropy pool, as an additional entropy source for good measure.
- */
 void get_local_random_bytes(uint8_t *out, size_t out_len)
 {
 	static int rand_chardev = -1;
@@ -102,20 +39,16 @@ void get_local_random_bytes(uint8_t *out, size_t out_len)
 	ssize_t read_len;
 	do {
 		read_len = read(rand_chardev, out, out_len);
-		if (read_len < 0) {
+		if (read_len <= 0) {
 			fprintf(stderr, "Error: unable to read from random number source (%s)\n",
 				strerror(errno));
 			exit(errno);
 		}
 		out_len -= read_len;
 		out += read_len;
-	} while(read_len > 0);
+	} while(out_len > 0);
 }
 
-/**
- * Prints an error message if something unexpected prevents opening the
- * given character device and returns -1, otherwise returns 0.
- */
 int tpm_open(const char *path, tpm_context_t *tpm)
 {
 	tpm->chardev_fd = open(path, O_RDWR | O_SYNC);
@@ -132,20 +65,20 @@ int tpm_open(const char *path, tpm_context_t *tpm)
 		return errno;
 	}
 	strncpy(tpm->chardev_path, path, sizeof(tpm->chardev_path));
+	DEBUG_INFO("Successfully opened %s. Requesting entropy...\n", tpm->chardev_path);
 	// Stir the local entropy pool thanks to the TPM's one, in case we're
 	// running low during boot
 	uint8_t tpm_entropy[255] = {0};
 	int res = tpm_get_random_bytes(tpm, tpm_entropy, sizeof(tpm_entropy));
 	if (res != 0)
 		DEBUG_WARN("Unable to stir local entropy pool: error %d\n", res);
+	DEBUG_INFO("Seeding local entropy pool using %zu bytes from TPM...\n",
+		sizeof(tpm_entropy));
 	get_local_random_bytes(tpm_entropy, sizeof(tpm_entropy));
 	//TODO: Stir the TPM's entropy pool thanks to the local one
 	return 0;
 }
 
-/**
- * Releases all allocated resources associated with the given TPM context.
- */
 int tpm_close(tpm_context_t *tpm)
 {
 	int res = 0;
@@ -188,12 +121,6 @@ uint16_t deserialize_uint16(uint8_t *blob)
 	return ((blob[0] << 8) | blob[1]);
 }
 
-/**
- * Ask the TPM for cryptographically securely generated random bytes.
- * This function may block for some time, since multiple requests might be
- * necessary to get the requested number of bytes (some TPMs give ~100 bytes
- * at a time).
- */
 int tpm_get_random_bytes(tpm_context_t *tpm, uint8_t *out, size_t out_len)
 {
 	if (out == NULL || out_len > MAX_INT)
@@ -257,16 +184,68 @@ cleanup:
 	return res;
 }
 
-int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth, uint8_t req,
-		size_t req_len, const sha1_hash_t *passwd_digest)
+int tpm_auth_oiap(tpm_context_t *tpm, tpm_oiap_auth_t *auth, uint8_t *req,
+		size_t main_req_len, const sha1_digest_t *passwd_digest)
 {
-	get_local_random_bytes(auth->nonce_local, sizeof(auth->nonce_local));
+	// Request a nonce from the TPM
+	int res = 0;
+	uint8_t buf[TPM_HEADER_SIZE] = {0};
+	uint64_t req_len = 0;
+	req_len += serialize_uint16(buf, req_len, TPM_TAG_RQU_COMMAND);
+	req_len += serialize_uint32(buf, req_len, TPM_HEADER_SIZE);
+	req_len += serialize_uint32(buf, req_len, TPM_ORD_OIAP);
+	DEBUG_HEXDUMP(buf, req_len);
+	size_t req_sent = write(tpm->chardev_fd, buf, req_len);
+	if (req_sent != req_len) {
+		fprintf(stderr, "Error: truncated write to TPM device (%s)\n",
+				strerror(errno));
+		res = errno;
+		goto cleanup;
+	}
+	size_t read_len = read(tpm->chardev_fd, buf, TPM_HEADER_SIZE + sizeof(uint32_t) + sizeof(nonce_t));
+	DEBUG_HEXDUMP(buf, read_len);
+	if (read_len < TPM_HEADER_SIZE) {
+		fprintf(stderr, "Error: truncated read from TPM (%zu bytes)\n", read_len);
+		res = EINVAL;
+		goto cleanup;
+	}
+	uint16_t resp_tag = deserialize_uint16(buf);
+	uint32_t resp_len = deserialize_uint32(&buf[2]);
+	uint32_t resp_code = deserialize_uint32(&buf[6]);
+	if (resp_tag != TPM_TAG_RSP_COMMAND) {
+		fprintf(stderr, "Error: invalid response tag 0x%04X\n", resp_tag);
+		res = EINVAL;
+		goto cleanup;
+	} else if (resp_code != 0) {
+		DEBUG_WARN("TPM returned error code %u\n", resp_code);
+		res = resp_code;
+		goto cleanup;
+	} else if (resp_len != TPM_HEADER_SIZE + sizeof(uint32_t) + sizeof(sha1_digest_t)) {
+		fprintf(stderr, "Error: malformed response, invalid payload length\n");
+		res = EINVAL;
+		goto cleanup;
+	}
+	auth->handle = deserialize_uint32(&buf[10]);
+	memcpy(&auth->nonce_tpm, &buf[14], sizeof(auth->nonce_tpm));
+	DEBUG_INFO("Auth handle acquired = %d\n", auth->handle);
+	DEBUG_INFO("TPM sent auth nonce:\n");
+	DEBUG_HEXDUMP(&auth->nonce_tpm, sizeof(auth->nonce_tpm));
 	auth->continue_auth_session = 0;
-	
+	// Generate our own nonce
+	get_local_random_bytes((uint8_t*)&auth->nonce_local, sizeof(auth->nonce_local));
+	// Get a digest of the request to be authenticated
+	sha1_digest_t req_digest = {0};
+	sha1(req, main_req_len, &req_digest);
+	// Get a HMAC of that digest + the TPM's nonce + our nonce + the
+	// "continue session" parameter, with the secret's digest as a key
+	hmac_sha1((uint8_t*)auth, TPM_OIAP_AUTH_SIZE, (uint8_t*)passwd_digest,
+		SHA1_DIGEST_SIZE, &auth->hmac);
+cleanup:
+	return res;
 }
 
 int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
-                   size_t out_len, const sha1_hash_t *owner_passwd_digest)
+                   size_t out_len, const sha1_digest_t *owner_passwd_digest)
 {
 	if (out == NULL || out_len > MAX_INT)
 		return -EINVAL;
@@ -274,15 +253,12 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 	uint8_t *buf = malloc(TPM_HEADER_SIZE + sizeof(uint32_t) + out_len);
 	if (buf == NULL)
 		return ENOMEM;
-	uint32_t tag = TPM_TAG_RQU_COMMAND;
-	tpm_oiap_auth_t auth;
-	if (owner_passwd_digest != NULL) {
-		tag = TPM_TAG_RQU_AUTH1_COMMAND;
-
-	}
 	while (out_len > 0) {
+		DEBUG_INFO("Requesting %zu bytes at offset %d from index %d\n",
+			out_len, offset, addr);
 		// Header
 		uint64_t req_len = 0;
+		uint16_t tag = (owner_passwd_digest == NULL ? TPM_TAG_RQU_COMMAND : TPM_TAG_RQU_AUTH1_COMMAND);
 		req_len += serialize_uint16(buf, req_len, tag);
 		req_len += serialize_uint32(buf, req_len, TPM_HEADER_SIZE + sizeof(uint32_t)*3);
 		req_len += serialize_uint32(buf, req_len, TPM_ORD_NV_ReadValue);
@@ -291,6 +267,12 @@ int tpm_read_nvram(tpm_context_t *tpm, int addr, int offset, uint8_t *out,
 		req_len += serialize_uint32(buf, req_len, (uint32_t)offset);
 		req_len += serialize_uint32(buf, req_len, (uint32_t)out_len);
 		DEBUG_HEXDUMP(buf, req_len);
+		if (owner_passwd_digest != NULL) {
+			DEBUG_INFO("Performing OIAP authorization...\n");
+			tpm_oiap_auth_t auth = {0};
+			res = tpm_auth_oiap(tpm, &auth, buf, req_len, owner_passwd_digest);
+			DEBUG_INFO("OIAP result = %d\n", res);
+		}
 		size_t req_sent = write(tpm->chardev_fd, buf, req_len);
 		if (req_sent != req_len) {
 			fprintf(stderr, "Error: truncated write to TPM device (%s)\n",

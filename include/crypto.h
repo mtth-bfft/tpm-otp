@@ -10,6 +10,10 @@ typedef struct {
 	uint8_t  buffer[64];
 } sha1_ctx_t;
 
+typedef struct __attribute__((__packed__)) {
+	uint8_t hash[SHA1_DIGEST_SIZE];
+} sha1_digest_t;
+
 /*
  * Securely dispose of sensitive data in RAM. memset() can be optimised-out by some compilers,
  * see cert.org MSC06-C
@@ -29,17 +33,17 @@ extern void sha1_update(sha1_ctx_t *ctx, const uint8_t *in, size_t in_len);
 /**
  * Add padding and return the entire message digest
  */
-extern void sha1_final(sha1_ctx_t *ctx, uint8_t out[SHA1_DIGEST_SIZE]);
+extern void sha1_final(sha1_ctx_t *ctx, sha1_digest_t *out);
 
 /**
  * Digests the given input buffer and directly writes the result to the output
  * buffer (which should be SHA1_DIGEST_SIZE bytes long at least).
  */
-extern void sha1(const uint8_t *in, size_t in_len, uint8_t out[SHA1_DIGEST_SIZE]);
+extern void sha1(const uint8_t *in, size_t in_len, sha1_digest_t *out);
 
 /**
  * Computes the HMAC-SHA1 of the given input buffer using a given key, then
  * writes the result to the output buffer (which must be at least
  * SHA1_DIGEST_LENGTH-byte long).
  */
-extern void hmac_sha1(const uint8_t *in, size_t in_len, const uint8_t *key, size_t key_len, uint8_t *out);
+extern void hmac_sha1(const uint8_t *in, size_t in_len, const uint8_t *key, size_t key_len, sha1_digest_t *out);

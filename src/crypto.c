@@ -164,20 +164,18 @@ void sha1_update(sha1_ctx_t *ctx, const uint8_t *in, size_t in_len)
 	memcpy(&ctx->buffer[j], &in[i], in_len - i);
 }
 
-void sha1_final(sha1_ctx_t *ctx, uint8_t out[SHA1_DIGEST_SIZE])
+void sha1_final(sha1_ctx_t *ctx, sha1_digest_t *out)
 {
 	uint8_t finalcount[8] = {0};
 	for (int i = 0; i < 8; i++)
-		finalcount[i] = (uint8_t)((ctx->count[(i >= 4 ? 0 : 1)] >> ((3-(i & 3)) * 8) ) & 255);
+		finalcount[i] = (uint8_t)((ctx->count[(i >= 4 ? 0 : 1)] >> ((3-(i & 3)) * 8)) & 255);
 	sha1_update(ctx, (uint8_t *)"\200", 1);
 	while ((ctx->count[0] & 504) != 448)
 		sha1_update(ctx, (uint8_t *)"\0", 1);
 	sha1_update(ctx, finalcount, 8); // Should cause SHA1_Transform
+	uint8_t *out_bytes = (uint8_t*)out;
 	for (int i = 0; i < SHA1_DIGEST_SIZE; i++)
-		out[i] = (uint8_t)((ctx->state[i>>2] >> ((3-(i & 3)) * 8) ) & 255);
-
-	// Make SHA1Transform overwrite its own static vars
-	sha1_transform(ctx->state, ctx->buffer);
+		out_bytes[i] = (uint8_t)((ctx->state[i>>2] >> ((3-(i & 3)) * 8)) & 255);
 
 	secure_wipe((uint8_t*)&ctx->buffer, sizeof(ctx->buffer));
 	secure_wipe((uint8_t*)&ctx->state, sizeof(ctx->state));
@@ -185,7 +183,7 @@ void sha1_final(sha1_ctx_t *ctx, uint8_t out[SHA1_DIGEST_SIZE])
 	secure_wipe((uint8_t*)&finalcount, sizeof(finalcount));
 }
 
-void sha1(const uint8_t *in, size_t in_len, uint8_t out[SHA1_DIGEST_SIZE])
+void sha1(const uint8_t *in, size_t in_len, sha1_digest_t *out)
 {
 	sha1_ctx_t ctx;
 	sha1_init(&ctx);
@@ -194,18 +192,18 @@ void sha1(const uint8_t *in, size_t in_len, uint8_t out[SHA1_DIGEST_SIZE])
 }
 
 void hmac_sha1(const uint8_t *in, size_t in_len, const uint8_t *key,
-               size_t key_len, uint8_t *out)
+               size_t key_len, sha1_digest_t *out)
 {
 	sha1_ctx_t ictx;
 	sha1_ctx_t octx;
-	uint8_t inner_hash[SHA1_DIGEST_SIZE] = {0};
-	uint8_t key_hash[SHA1_DIGEST_SIZE] = {0};
+	sha1_digest_t inner_hash = {0};
+	sha1_digest_t key_hash = {0};
 	uint8_t block[SHA1_BLOCK_SIZE] = {0};
 
 	// Use a digest of the key if it's larger than a block
 	if (key_len > SHA1_BLOCK_SIZE) {
-		sha1(key, key_len, key_hash);
-		key = key_hash;
+		sha1(key, key_len, &key_hash);
+		key = (const uint8_t*)&key_hash;
 		key_len = SHA1_DIGEST_SIZE;
 	}
 
@@ -213,23 +211,23 @@ void hmac_sha1(const uint8_t *in, size_t in_len, const uint8_t *key,
 	sha1_init(&ictx);
 	for (size_t i = 0; i < key_len; i++)
 		block[i] = key[i] ^ 0x36;
-	for (size_t i = key_len; i < SHA1_BLOCK_SIZE; i++)
+	for (size_t i = key_len; i < sizeof(block); i++)
 		block[i] = 0x36;
-	sha1_update(&ictx, block, SHA1_BLOCK_SIZE);
+	sha1_update(&ictx, block, sizeof(block));
 	sha1_update(&ictx, in, in_len);
-	sha1_final(&ictx, inner_hash);
+	sha1_final(&ictx, &inner_hash);
 
 	// Outer digest with another padded version of the key
 	sha1_init(&octx);
 	for (size_t i = 0; i < key_len; i++)
 		block[i] = key[i] ^ 0x5c;
-	for (size_t i = key_len; i < SHA1_BLOCK_SIZE; i++)
+	for (size_t i = key_len; i < sizeof(block); i++)
 		block[i] = 0x5c;
-	sha1_update(&octx, block, SHA1_BLOCK_SIZE);
-	sha1_update(&octx, inner_hash, SHA1_DIGEST_SIZE);
+	sha1_update(&octx, block, sizeof(block));
+	sha1_update(&octx, (uint8_t*)&inner_hash, sizeof(inner_hash));
 	sha1_final(&octx, out);
 
-	secure_wipe(inner_hash, sizeof(inner_hash));
-	secure_wipe(key_hash, sizeof(key_hash));
+	secure_wipe((uint8_t*)&inner_hash, sizeof(inner_hash));
+	secure_wipe((uint8_t*)&key_hash, sizeof(key_hash));
 	secure_wipe(block, sizeof(block));
 }
